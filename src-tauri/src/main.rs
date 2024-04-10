@@ -22,11 +22,26 @@ struct VideoProcessingStats {
     frame: i32,
     fps: f32,
     out_time_ms: f32,
+    completed: bool,
 }
 
+#[derive(Serialize, Deserialize)]
+struct VideoInfo {
+    width: i64,
+    height: i64,
+    nb_packets: i64,
+    bit_rate: i64,
+}
+
+struct GlobalState {
+    app_data_dir: Arc<Mutex<String>>,
+}
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(not(target_os = "windows"))]
+const CREATE_NO_WINDOW: u32 = 0;
 
 const FFMPEG_VERSION: &str = "7.0";
 
@@ -43,11 +58,12 @@ fn convert_tauri_url_to_path(url: String) -> Result<String, Box<dyn std::error::
     Ok(final_path)
 }
 
-async fn watch_progress_file(progress_file_path: String, window: Window) {
+async fn watch_progress_file(progress_file_path: String, window: &Window) {
     let mut stats = VideoProcessingStats {
         frame: 0,
         fps: 0.0,
         out_time_ms: 0.0,
+        completed: false,
     };
     let mut end_detected = false;
 
@@ -74,7 +90,7 @@ async fn watch_progress_file(progress_file_path: String, window: Window) {
                             updated = true;
                         }
                     } else if line.starts_with("out_time_ms=") {
-                        let time = line.replace("out_time_ms=", "").parse::<f32>().unwrap();
+                        let time = line.replace("out_time_ms=", "").parse::<f32>().unwrap_or_default();
                         if time > stats.out_time_ms {
                             stats.out_time_ms = time;
                             updated = true;
@@ -84,11 +100,11 @@ async fn watch_progress_file(progress_file_path: String, window: Window) {
                         if progress == "end" {
                             if end_detected {
                                 println!("Video processing complete");
-                                window.emit("video-processing-complete", &stats).unwrap();
+                                window.emit("video-processing-stats", &stats).unwrap();
                                 return;
                             } else {
                                 println!("End detected, waiting for continue");
-                                window.emit("video-processing-complete", &stats).unwrap();
+                                stats.completed = true;
                                 end_detected = true;
                             }
                         } else if progress == "continue" {
@@ -110,7 +126,7 @@ async fn watch_progress_file(progress_file_path: String, window: Window) {
     }
 }
 
-async fn run_ffmpeg(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_ffmpeg(args: &[&str], window: &Window) -> Result<(), Box<dyn std::error::Error>> {
     // Select the correct FFmpeg binary based on the OS (ffmpeg[version]-[os])
     let ffmpeg_path = if cfg!(target_os = "windows") {
         format!("./src/binaries/ffmpeg{}-win.exe", FFMPEG_VERSION)
@@ -124,16 +140,11 @@ async fn run_ffmpeg(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut child = Command::new(ffmpeg_path)
         .args(args)
+        .stderr(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
 
-    let stderr = child.stderr.take().unwrap();
-    let mut reader = tokio::io::BufReader::new(stderr).lines();
-
-    while let Some(_line) = reader.next_line().await? {
-        //println!("{}", line);
-    }
 
     let status = child.wait().await?;
     if !status.success() {
@@ -144,6 +155,7 @@ async fn run_ffmpeg(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("FFmpeg command completed successfully");
+    window.emit("video-processing-complete", &"").unwrap();
 
     Ok(())
 }
@@ -203,6 +215,8 @@ async fn simple_video_processing<'a>(
         }
     };
 
+    let window_clone = window.clone();
+
     let usr_data_dir = state.app_data_dir.lock().unwrap().clone();
     let random_uuid = Uuid::new_v4();
 
@@ -239,7 +253,6 @@ async fn simple_video_processing<'a>(
             "-i",
             &path_clone,
             "-hide_banner",
-            // Flushes the output after each frame to get the progress
             "-flush_packets",
             "1",
             "-c:v",
@@ -258,24 +271,17 @@ async fn simple_video_processing<'a>(
             &progress_file_path,
         ];
 
-        if let Err(e) = run_ffmpeg(&args).await {
+        if let Err(e) = run_ffmpeg(&args, &window_clone).await {
             eprintln!("Error processing video: {}", e);
         }
     });
 
+    let window_clone = window.clone();
     tokio::spawn(async move {
-        watch_progress_file(progress_file_clone, window).await;
+        watch_progress_file(progress_file_clone, &window_clone).await;
     });
 
     Ok("Simple video processing started".to_string())
-}
-
-#[derive(Serialize, Deserialize)]
-struct VideoInfo {
-    width: i64,
-    height: i64,
-    nb_packets: i64,
-    bit_rate: i64,
 }
 
 #[tauri::command]
@@ -336,10 +342,104 @@ async fn get_video_stats(url: String) -> Result<Vec<VideoInfo>, ()> {
     }
 }
 
+#[derive(Deserialize)]
+struct VideoProcessingParams {
+    url: String,
+    output_path: String,
+    preset: String,
+    video_codec: String,
+    audio_codec: String,
+    width: i32,
+    height: i32,
+}
 
+#[tauri::command]
+async fn process_video_with_params(
+    args: VideoProcessingParams,
+    window: Window,
+    state: State<'_, GlobalState>,
+) -> Result<String, ()> {
+    let path = match convert_tauri_url_to_path(args.url) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error converting URL to path: {}", e);
+            return Err(());
+        }
+    };
 
-struct GlobalState {
-    app_data_dir: Arc<Mutex<String>>,
+    let window_clone = window.clone();
+
+    let usr_data_dir = state.app_data_dir.lock().unwrap().clone();
+    let random_uuid = Uuid::new_v4();
+
+    let progress_file_path = format!(
+        "{}/tauri-ffmpeg-progress-{}.txt",
+        usr_data_dir.as_str(),
+        random_uuid
+    );
+    let progress_file_clone = progress_file_path.clone();
+
+    // Create a progress file
+    if let Err(e) = std::fs::write(&progress_file_path, "") {
+        eprintln!("Error creating progress file: {}", e);
+        return Err(());
+    }
+
+    // Check if the user data directory exists, if not create it
+    if !Path::new(&usr_data_dir).exists() {
+        if let Err(e) = std::fs::create_dir_all(&usr_data_dir) {
+            eprintln!("Error creating user data directory: {}", e);
+            return Err(());
+        }
+    }
+
+    println!("Processing video at path: {}", path);
+    println!("Progress file path: {}", progress_file_path);
+
+    let width = args.width.clone();
+    let height = args.height.clone();
+    let scale = format!("scale={}:{}", width, height);
+
+    // The output file should be the same location as the input file but using the output path as the filename
+    let output_path = args.output_path.clone();
+    let parent_dir = Path::new(&path).parent().unwrap();
+    let output_path = parent_dir.join(output_path);
+
+    tokio::spawn(async move {
+        let path_clone = path.clone();
+        let args = [
+            "-i",
+            &path_clone,
+            "-hide_banner",
+            "-flush_packets",
+            "1",
+            "-c:v",
+            &args.video_codec,
+            "-preset",
+            &args.preset,
+            "-c:a",
+            &args.audio_codec,
+            "-b:a",
+            "128k",
+            "-vf",
+            &scale,
+            "-y",
+            &output_path.to_str().unwrap(),
+            "-progress",
+            &progress_file_path,
+        ];
+
+        if let Err(e) = run_ffmpeg(&args, &window_clone).await {
+            eprintln!("Error processing video: {}", e);
+        }
+    });
+
+    let window_clone = window.clone();
+    tokio::spawn(async move {
+        watch_progress_file(progress_file_clone, &window_clone).await;
+    });
+
+    Ok("Video processing started".to_string())
 }
 
 fn main() {
@@ -363,7 +463,7 @@ fn main() {
             Ok(())
         })
         .plugin(tauri_plugin_fs::init())
-        .invoke_handler(tauri::generate_handler![simple_video_processing, get_video_stats])
+        .invoke_handler(tauri::generate_handler![simple_video_processing, get_video_stats, process_video_with_params])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

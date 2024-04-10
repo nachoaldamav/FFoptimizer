@@ -53,39 +53,41 @@ export function CompressionOptions({ source }: { source: string | null }) {
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
+    const params = {
+      url: source,
+      width: resolution.width,
+      height: resolution.height,
+      preset,
+      // AV1 codec
+      video_codec: 'hevc_amf',
+      audio_codec: 'aac',
+      output_path: 'output.mp4',
+    };
+
     // Call to backend with parameters
     console.log('Processing video with parameters:', {
-      resolution,
-      preset,
-      cropVideo,
+      args: params,
     });
 
     const statsListener = await listen<{
       frame: number;
       fps: number;
       time: number;
+      completed: boolean;
     }>('video-processing-stats', (event) => {
       console.log('Progress:', event);
+      if (event.payload.completed) {
+        console.log('Video processing completed!');
+        statsListener();
+      }
+    });
+
+    // Replace the following line with the actual Tauri invoke command
+    await invoke('process_video_with_params', {
+      args: params,
     });
 
     console.log('Listening for progress updates...');
-
-    // Replace the following line with the actual Tauri invoke command
-    await invoke('simple_video_processing', {
-      url: source,
-      resolution,
-      preset,
-      cropVideo,
-    });
-
-    let completed = false;
-    while (!completed) {
-      await once('video-processing-completed', () => {
-        completed = true;
-        console.log('Processing completed!');
-        statsListener();
-      });
-    }
   };
 
   const handleWidthChange = (event: React.ChangeEvent<HTMLInputElement>) => {
