@@ -8,7 +8,7 @@ import {
   SelectTrigger,
 } from './ui/select';
 import { invoke } from '@tauri-apps/api/core';
-import { listen, once } from '@tauri-apps/api/event';
+import { listen } from '@tauri-apps/api/event';
 
 type VideoStats = {
   bit_rate: number;
